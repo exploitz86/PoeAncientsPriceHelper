@@ -23,8 +23,8 @@ captures frames via the GPU, and has been audited for race conditions and resour
   each price refresh). Skips the dictionary scan + Levenshtein work on every subsequent pass.
 - **Length-bucketed fuzzy index** — the fuzzy matcher only scans price keys within ±3 characters
   of the OCR'd name length, not the entire dictionary.
-- **Conditional OCR** — the second Tesseract pass (SparseText) only runs when the first pass
-  (SingleColumn) found fewer than 3 rows, skipping its cost on normal panels.
+- **Windows OCR** — Tesseract has been replaced with the native `Windows.Media.Ocr` engine,
+  which is better suited to real-time rendered screen text and removes the tessdata dependency.
 - **Pre-compiled regexes** — all `Regex` instances in the hot path are now `static readonly`
   with `RegexOptions.Compiled`.
 - **Parallel price fetch** — all exchange types are fetched concurrently via `Task.WhenAll`
@@ -32,7 +32,7 @@ captures frames via the GPU, and has been audited for race conditions and resour
 
 ### OCR improvements
 
-- **3x upscaling** (was 2x) — more pixels per glyph means Tesseract reads names correctly on the
+- **3x upscaling** (was 2x) — more pixels per glyph means OCR reads names correctly on the
   first pass more often, so prices appear faster.
 - **80ms OCR interval** (was 100ms) — more attempts per second while a panel is open.
 - **High-confidence fuzzy lock** — fuzzy matches with similarity ≥ 0.92 now lock in 1 read

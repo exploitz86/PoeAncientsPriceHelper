@@ -213,8 +213,7 @@ public partial class App : System.Windows.Application
             using (var g = System.Drawing.Graphics.FromImage(region))
                 g.DrawImage(full, new System.Drawing.Rectangle(0, 0, rect.Width, rect.Height), rect, System.Drawing.GraphicsUnit.Pixel);
 
-            var tessdata = System.IO.Path.Combine(AppContext.BaseDirectory, "tessdata");
-            using var scanner = new OcrScanner(tessdata, Out, debug: true);   // --ocr-test wants the dump
+            var scanner = new OcrScanner(Out, debug: true);   // --ocr-test wants the dump
             var rows = scanner.Scan(region);
             Out($"[ocr-test] merged {rows.Count} rows:");
             foreach (var row in rows)

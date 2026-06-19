@@ -57,7 +57,7 @@ crashing.
 ## Tech
 
 - **.NET 10** (`net10.0-windows10.0.19041.0`) — WPF (settings window) + WinForms (overlay)
-- **Tesseract** OCR with 3x upscaling for glyph accuracy
+- **Windows.Media.Ocr** OCR with 3x upscaling for glyph accuracy
 - **Windows Graphics Capture** via Vortice.Direct3D11 + WinRT interop
 - **poe.ninja** API for live price data (parallel fetch, 30-min auto-refresh)
 - **SharpHook** for global hotkeys

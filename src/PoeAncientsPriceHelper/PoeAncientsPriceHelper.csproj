@@ -7,9 +7,12 @@
     <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
     <UseWPF>true</UseWPF>
+    <!-- Per-Monitor-V2 DPI awareness for both WPF (settings window) and WinForms (overlay).
+         Set as a project property so the runtime applies it before any framework code runs,
+         replacing the old app.manifest DPI declaration (WFO0003). -->
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <RootNamespace>PoeAncientsPriceHelper</RootNamespace>
     <ApplicationIcon>app.ico</ApplicationIcon>
-    <!-- Declares Per-Monitor-V2 DPI awareness at process start (see app.manifest, issue #8). -->
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AssemblyTitle>Poe Ancients Price Helper</AssemblyTitle>
     <Product>Poe Ancients Price Helper</Product>
@@ -32,8 +35,6 @@
     <PackageReference Include="MahApps.Metro" Version="2.4.11" />
     <PackageReference Include="SharpHook" Version="7.1.2" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
-    <PackageReference Include="Tesseract" Version="5.2.0" />
-    <PackageReference Include="Tesseract.Data.English" Version="4.0.0" />
     <PackageReference Include="Vortice.Direct3D11" Version="3.8.3" />
     <PackageReference Include="Vortice.DXGI" Version="3.8.3" />
   </ItemGroup>
