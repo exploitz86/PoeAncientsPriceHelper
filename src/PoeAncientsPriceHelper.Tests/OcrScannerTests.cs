@@ -59,4 +59,16 @@ public class OcrScannerTests
     {
         Assert.Equal(expected, OcrScanner.ExtractMultiplier(input));
     }
+
+    [Theory]
+    [InlineData("3x orb of alchemy", 3, true)]
+    [InlineData("1x orb of alchemy", 1, true)]
+    [InlineData("orb of alchemy", 1, false)]
+    [InlineData("warding rune of protection i", 1, false)]
+    public void ExtractMultiplierWithConfidence_TracksExplicitMarker(string input, int expectedMultiplier, bool expectedExplicit)
+    {
+        var (multiplier, explicitHit) = OcrScanner.ExtractMultiplierWithConfidence(input);
+        Assert.Equal(expectedMultiplier, multiplier);
+        Assert.Equal(expectedExplicit, explicitHit);
+    }
 }

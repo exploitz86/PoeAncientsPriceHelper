@@ -1,13 +1,15 @@
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
+using System.Runtime.InteropServices.WindowsRuntime;
 using Windows.Globalization;
 using Windows.Graphics.Imaging;
 using Windows.Media.Ocr;
 
 namespace PoeAncientsPriceHelper;
 
-internal sealed record OcrRow(string NormalizedName, string RawText, int CenterY, int Multiplier = 1);
+internal sealed record OcrRow(string NormalizedName, string RawText, int CenterY,
+                              int Multiplier = 1, bool MultiplierExplicit = false);
 
 internal sealed class OcrScanner
 {
@@ -62,6 +64,12 @@ internal sealed class OcrScanner
         var result = _engine.RecognizeAsync(softwareBitmap).AsTask().GetAwaiter().GetResult();
         var rows = ExtractRows(result, height, scale);
 
+        // Quantity prefix-only OCR: read the left band separately and merge explicit Nx hits by row Y.
+        using var prefixBand = CropBitmap(upscaled, 0, 0, Math.Max(1, (int)(upscaled.Width * 0.22)), upscaled.Height);
+        using var prefixBitmap = ToSoftwareBitmap(prefixBand);
+        var prefixResult = _engine.RecognizeAsync(prefixBitmap).AsTask().GetAwaiter().GetResult();
+        rows = MergePrefixMultipliers(rows, ExtractPrefixMultipliers(prefixResult, height, scale));
+
         // When OCR catches few rows, dump the exact image fed to Windows OCR for inspection. Debug-only:
         // for end users this would be needless disk churn (~every 100ms while a panel mis-detects).
         if (_debug && rows.Count <= 2)
@@ -79,6 +87,49 @@ internal sealed class OcrScanner
         int byWidth = maxDim / Math.Max(1, bitmap.Width);
         int byHeight = maxDim / Math.Max(1, bitmap.Height);
         return Math.Max(1, Math.Min(UpscaleFactor, Math.Min(byWidth, byHeight)));
+    }
+
+    private static IReadOnlyList<(int CenterY, int Multiplier)> ExtractPrefixMultipliers(OcrResult result, int bitmapHeight, int scale)
+    {
+        var hits = new List<(int CenterY, int Multiplier)>();
+        foreach (var line in result.Lines)
+        {
+            if (string.IsNullOrWhiteSpace(line.Text) || line.Words.Count == 0) continue;
+            var normalized = NameNormalizer.Normalize(line.Text);
+            var (mult, explicitHit) = ExtractMultiplierWithConfidence(normalized);
+            if (!explicitHit) continue;
+            int centerY = GetLineCenterY(line, bitmapHeight, scale);
+            hits.Add((centerY, mult));
+        }
+        return hits;
+    }
+
+    private static IReadOnlyList<OcrRow> MergePrefixMultipliers(
+        IReadOnlyList<OcrRow> rows,
+        IReadOnlyList<(int CenterY, int Multiplier)> prefixHits)
+    {
+        if (rows.Count == 0 || prefixHits.Count == 0) return rows;
+        const int Tol = 22;
+        var list = rows.ToList();
+        var used = new bool[prefixHits.Count];
+        for (int i = 0; i < list.Count; i++)
+        {
+            if (list[i].MultiplierExplicit) continue;
+            int best = int.MaxValue;
+            int bestIdx = -1;
+            for (int j = 0; j < prefixHits.Count; j++)
+            {
+                if (used[j]) continue;
+                int d = Math.Abs(prefixHits[j].CenterY - list[i].CenterY);
+                if (d <= Tol && d < best) { best = d; bestIdx = j; }
+            }
+            if (bestIdx >= 0)
+            {
+                used[bestIdx] = true;
+                list[i] = list[i] with { Multiplier = prefixHits[bestIdx].Multiplier, MultiplierExplicit = true };
+            }
+        }
+        return list;
     }
 
     private static Bitmap CropBitmap(Bitmap src, int x, int y, int w, int h)
@@ -114,15 +165,20 @@ internal sealed class OcrScanner
             {
                 centerY = GetLineCenterY(line, bitmapHeight, scale);
                 var normalizedRaw = NameNormalizer.Normalize(text);
-                multiplier = ExtractMultiplier(normalizedRaw);
+                var parsed = ExtractMultiplierWithConfidence(normalizedRaw);
+                multiplier = parsed.Multiplier;
+                bool multiplierExplicit = parsed.Explicit;
                 normalized = StripLeadingNoise(normalizedRaw);
                 if (normalized.Length < MinNameLength) reject = "short";
                 else if (!HasLongWord(normalized, MinWordLength)) reject = "noword";
+
+                if (reject is null)
+                    rows.Add(new OcrRow(normalized, text.Trim(), centerY, multiplier, multiplierExplicit));
+                diag?.Add($"y={centerY} words={line.Words.Count} '{(text ?? "").Trim()}'{(reject is null ? "" : $" REJ:{reject}")}");
+                continue;
             }
 
-            if (reject is null)
-                rows.Add(new OcrRow(normalized, text.Trim(), centerY, multiplier));
-            diag?.Add($"y={centerY} words={line.Words.Count} '{(text ?? "").Trim()}'{(reject is null ? "" : $" REJ:{reject}")}");
+            diag?.Add($"y=0 words=0 '{(text ?? "").Trim()}'{(reject is null ? "" : $" REJ:{reject}")}");
         }
 
         rows.Sort((x, y) => x.CenterY.CompareTo(y.CenterY));
@@ -163,10 +219,15 @@ internal sealed class OcrScanner
     // normalized string BEFORE StripLeadingNoise removes the marker. Returns 1 when absent.
     internal static int ExtractMultiplier(string normalized)
     {
+        return ExtractMultiplierWithConfidence(normalized).Multiplier;
+    }
+
+    internal static (int Multiplier, bool Explicit) ExtractMultiplierWithConfidence(string normalized)
+    {
         var m = MultiplierPattern.Match(normalized);
         if (m.Success && int.TryParse(m.Groups[1].Value, out var n) && n >= 1)
-            return Math.Min(n, 999);
-        return 1;
+            return (Math.Min(n, 999), true);
+        return (1, false);
     }
 
     // Strip leading noise: short/numeric tokens ("e", "l8"), then anything before the first

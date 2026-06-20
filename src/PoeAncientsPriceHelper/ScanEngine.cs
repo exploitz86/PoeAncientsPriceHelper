@@ -87,12 +87,8 @@ internal sealed class ScanEngine : IDisposable
         var sw = Stopwatch.StartNew();
         var slots = new List<RowSlot>();             // per-row accumulator: priced rows lock, misses keep retrying
         IReadOnlyList<PriceRow> lastRows = [];       // what the overlay shows
-        // Last state actually pushed to the overlay. The loop ticks ~10×/s but the displayed rows
-        // only change when OCR resolves something new, so skipping UpdateState when nothing changed
-        // avoids needless cross-thread marshalling / repaints on the hot path.
-        IReadOnlyList<PriceRow> lastPushedRows = [];
-        bool lastPushedConfirmed = false;
-        bool lastPushedReading = false;
+        var quantityMemory = new Dictionary<string, (int Multiplier, DateTime ExpiresUtc)>(StringComparer.Ordinal);
+        var scrollHoldoffUntil = DateTime.MinValue;
         int topmostCounter = 0;
         const int TopmostEveryN = 10;
         bool isOpen = false;          // brightness gate: bright enough to attempt OCR
@@ -106,13 +102,14 @@ internal sealed class ScanEngine : IDisposable
         int brightStreak = 0;
         int darkStreak = 0;
         int dismissDark = 0;          // dark frames seen while dismissed — releases the latch when the panel closes
-        int staleCount = 0;           // consecutive 0-row OCR passes — clears stale overlay on loading screens
-        const int StaleLimit = 10;    // consecutive 0-row OCR passes before clearing (~800ms at 80ms interval)
         int cycleCount = 0;
         var lastOcrAt = DateTime.MinValue;
-        const int MinOcrIntervalMs = 150;            // OCR floor while panel is open — Windows OCR is fast enough that 6.7/s gives sub-200ms turnaround
-        const int OpenCycleMs = 120;                 // tight loop while scanning
-        const int ClosedCycleMs = 300;               // polling while watching for the panel — halves idle capture cost
+        int ocrEmptyStreak = 0;                      // consecutive OCR passes with no usable priced rows
+        const int MinOcrIntervalMs = 75;             // OCR floor while panel is open — faster refresh while scrolling
+        const int OpenCycleMs = 75;                  // tight loop while scanning
+        const int ClosedCycleMs = 150;               // polling while watching for the panel — snappy detection
+        const int ClearAfterEmptyOcr = 2;            // clear stale rows after ~200 ms of consecutive OCR misses
+        const int ScrollHoldoffMs = 125;             // suppress low-confidence rows briefly during active scroll motion
         const int DarkToRelease = 3;                 // dark frames before a dismiss latch releases
         // Asymmetric brightness hysteresis. A frame counts toward OPENING only above OpenBrightness and
         // toward CLOSING only below CloseBrightness; readings in the [80,100] dead zone hold the current
@@ -152,13 +149,12 @@ internal sealed class ScanEngine : IDisposable
                         Log("dismiss released (panel closed)");
                     }
                     isOpen = false; confirmedOpen = false; brightStreak = 0; darkStreak = 0;
+                    ocrEmptyStreak = 0;
+                    quantityMemory.Clear();
+                    scrollHoldoffUntil = DateTime.MinValue;
                     slots.Clear(); lastRows = [];
-                    staleCount = 0;
                     _showing = false;
-                    // Always push when dismissed to clear the overlay, and reset the change-tracker
-                    // so the next real state is treated as new.
-                    PriceOverlayManager.UpdateState([], false, false);
-                    lastPushedRows = []; lastPushedConfirmed = false; lastPushedReading = false;
+                    PriceOverlayManager.UpdateState([], false, false, null);
                 }
                 else
                 {
@@ -205,26 +201,19 @@ internal sealed class ScanEngine : IDisposable
                             var ocrRows = scanner.Scan(bmp);
                             if (ocrRows.Count == 0)
                             {
-                                staleCount++;
-                                // Hide stale prices quickly (after 2 passes ≈ 160ms) so they don't
-                                // linger on loading screens, but keep slots alive until StaleLimit
-                                // for fast recovery when the panel reappears.
-                                if (staleCount >= 2)
-                                    lastRows = [];
-                                if (staleCount >= StaleLimit)
+                                // Panel mid-animation or a bad frame. Keep rows for one miss to avoid
+                                // flicker, but clear stale prices if misses persist.
+                                ocrEmptyStreak++;
+                                if (ocrEmptyStreak >= ClearAfterEmptyOcr)
                                 {
-                                    Log($"OCR 0 rows for {staleCount} passes — clearing slots");
                                     slots.Clear();
+                                    lastRows = [];
                                     confirmedOpen = false;
                                 }
-                                else
-                                {
-                                    Log($"OCR 0 rows ({staleCount}/{StaleLimit})");
-                                }
+                                Log("OCR returned 0 rows");
                             }
                             else
                             {
-                                staleCount = 0;
                                 var reads = BuildPriceRows(ocrRows);
                                 Log($"OCR {ocrRows.Count} rows → " +
                                     string.Join(" | ", reads.Select(r =>
@@ -240,33 +229,48 @@ internal sealed class ScanEngine : IDisposable
                                     Log("panel CONFIRMED (priced row found)");
                                 }
 
-                                lastRows = MergeReads(slots, reads);
+                                // No priced rows in consecutive OCR passes usually means stale content;
+                                // clear locked rows quickly so old prices don't linger on-screen.
+                                if (reads.Any(r => r.HasPrice)) ocrEmptyStreak = 0;
+                                else if (++ocrEmptyStreak >= ClearAfterEmptyOcr)
+                                {
+                                    slots.Clear();
+                                    lastRows = [];
+                                    confirmedOpen = false;
+                                }
+
+                                // Per-row slots: a row locks once confirmed, then stays fixed;
+                                // unpriced rows keep being retried every pass.
+                                lastRows = MergeReads(slots, reads, quantityMemory, now, out bool scrollDetected);
+                                if (scrollDetected) scrollHoldoffUntil = now.AddMilliseconds(ScrollHoldoffMs);
+                                if (now < scrollHoldoffUntil)
+                                {
+                                    lastRows = lastRows.Select(r =>
+                                        r.HasPrice && r.Confidence < 0.85 && r.Multiplier <= 1 && !r.MultiplierExplicit
+                                            ? r with { HasPrice = false, DivineValue = 0m, ExaltedValue = 0m }
+                                            : r).ToList();
+                                }
                             }
                         }
                     }
                     else
                     {
+                        ocrEmptyStreak = 0;
+                        quantityMemory.Clear();
+                        scrollHoldoffUntil = DateTime.MinValue;
                         slots.Clear();
                         lastRows = [];
                         confirmedOpen = false;
-                        staleCount = 0;
                     }
 
                     // "reading" = brightness says a panel is up but OCR hasn't confirmed prices yet.
                     // Suppressed straight after a dismiss until a real confirm (anti-flicker, see above).
                     bool reading = isOpen && !confirmedOpen && !suppressHintUntilConfirm;
+                    string hud = BuildDebugHud(lastRows, DateTime.UtcNow < scrollHoldoffUntil);
 
                     // Show prices only once OCR has confirmed a real list, not on brightness alone.
                     _showing = confirmedOpen;
-                    // Skip the cross-thread UpdateState when nothing actually changed since the last
-                    // push — the loop ticks far faster than the displayed rows move.
-                    if (!lastRows.SequenceEqual(lastPushedRows) || confirmedOpen != lastPushedConfirmed || reading != lastPushedReading)
-                    {
-                        PriceOverlayManager.UpdateState(lastRows, confirmedOpen, reading);
-                        lastPushedRows = lastRows.ToArray();
-                        lastPushedConfirmed = confirmedOpen;
-                        lastPushedReading = reading;
-                    }
+                    PriceOverlayManager.UpdateState(lastRows, confirmedOpen, reading, hud);
 
                     topmostCounter++;
                     if (topmostCounter >= TopmostEveryN)
@@ -332,10 +336,11 @@ internal sealed class ScanEngine : IDisposable
             {
                 if (gemKey is not null && snapshot.TryGetValue(gemKey, out var gemEntry))
                     rows.Add(new PriceRow(stableY, row.RawText, gemEntry.DivineValue, gemEntry.ExaltedValue,
-                        true, row.Multiplier, gemKey, true));
+                        true, row.Multiplier, gemKey, true, MemeKind.None, row.MultiplierExplicit));
                 else
                     // Recognised as an uncut gem but type+level didn't pin to a known price → '?', never fuzzy.
-                    rows.Add(new PriceRow(stableY, row.RawText, 0m, 0m, false, row.Multiplier, row.NormalizedName));
+                    rows.Add(new PriceRow(stableY, row.RawText, 0m, 0m, false,
+                        row.Multiplier, row.NormalizedName, false, MemeKind.None, row.MultiplierExplicit));
                 continue;
             }
 
@@ -345,12 +350,14 @@ internal sealed class ScanEngine : IDisposable
             //    currency") → Mirror of Kalandra. "unique belt" → Headhunter.
             if (row.NormalizedName.Contains("random") && row.NormalizedName.Contains("currency"))
             {
-                rows.Add(new PriceRow(stableY, row.RawText, 0m, 0m, true, row.Multiplier, "random currency", true, MemeKind.Mirror));
+                rows.Add(new PriceRow(stableY, row.RawText, 0m, 0m, true,
+                    row.Multiplier, "random currency", true, MemeKind.Mirror, row.MultiplierExplicit));
                 continue;
             }
             if (row.NormalizedName.Contains("unique") && row.NormalizedName.Contains("belt"))
             {
-                rows.Add(new PriceRow(stableY, row.RawText, 0m, 0m, true, row.Multiplier, "unique belt", true, MemeKind.Headhunter));
+                rows.Add(new PriceRow(stableY, row.RawText, 0m, 0m, true,
+                    row.Multiplier, "unique belt", true, MemeKind.Headhunter, row.MultiplierExplicit));
                 continue;
             }
 
@@ -408,9 +415,11 @@ internal sealed class ScanEngine : IDisposable
             }
 
             if (entry != null)
-                rows.Add(new PriceRow(stableY, row.RawText, entry.DivineValue, entry.ExaltedValue, true, row.Multiplier, matchedKey, exact));
+                rows.Add(new PriceRow(stableY, row.RawText, entry.DivineValue, entry.ExaltedValue, true,
+                    row.Multiplier, matchedKey, exact, MemeKind.None, row.MultiplierExplicit));
             else
-                rows.Add(new PriceRow(stableY, row.RawText, 0m, 0m, false, row.Multiplier, row.NormalizedName));
+                rows.Add(new PriceRow(stableY, row.RawText, 0m, 0m, false,
+                    row.Multiplier, row.NormalizedName, false, MemeKind.None, row.MultiplierExplicit));
         }
         _lastPositions = newPositions;
         return rows;
@@ -506,11 +515,34 @@ internal sealed class ScanEngine : IDisposable
         public int Unseen;               // consecutive passes this slot wasn't matched
     }
 
-    private IReadOnlyList<PriceRow> MergeReads(List<RowSlot> slots, IReadOnlyList<PriceRow> reads)
+    private IReadOnlyList<PriceRow> MergeReads(
+        List<RowSlot> slots,
+        IReadOnlyList<PriceRow> reads,
+        Dictionary<string, (int Multiplier, DateTime ExpiresUtc)> quantityMemory,
+        DateTime nowUtc,
+        out bool scrollDetected)
     {
         const int Tolerance = 20;   // px: how far a read can move and still be the same row
         const int Confirm = 2;      // matching fuzzy/prefix reads before a row locks (exact: 1)
-        const int EvictAfter = 3;   // passes a slot can go unmatched before it's dropped
+        const int EvictAfter = 1;   // passes a slot can go unmatched before it's dropped (faster scroll cleanup)
+        const int NearDuplicateY = 18; // px: unmatched stale slot near a matched slot is removed immediately
+        const int UncertainSingleConfirm = 8; // uncertain 1x reads need stability before locking/rendering
+        const double RenderThreshold = 0.72;
+
+        scrollDetected = false;
+
+        // Trim expired quantity memory in-place.
+        foreach (var key in quantityMemory.Where(kv => kv.Value.ExpiresUtc <= nowUtc)
+                                          .Select(kv => kv.Key)
+                                          .ToList())
+            quantityMemory.Remove(key);
+
+        static string? SlotName(RowSlot s)
+        {
+            if (s.Locked && !string.IsNullOrEmpty(s.LockedRow.Name)) return s.LockedRow.Name;
+            if (s.Latest.HasPrice && !string.IsNullOrEmpty(s.Latest.Name)) return s.Latest.Name;
+            return null;
+        }
 
         // Panel-switch detection: the user opened a different panel without the overlay closing.
         // Locked rows are otherwise sticky (a miss never unlocks them), so they'd keep showing the
@@ -534,10 +566,34 @@ internal sealed class ScanEngine : IDisposable
         }
 
         var matched = new HashSet<RowSlot>();
+        int movedByScrollCount = 0;
         foreach (var read in reads)
         {
             RowSlot? slot = null;
             int best = int.MaxValue;
+            bool matchedByName = false;
+            bool movedByScroll = false;
+
+            // Scroll support: if the same priced item is read at a very different Y, reuse that
+            // existing slot by name and move it, instead of creating a second slot nearby.
+            if (read.HasPrice && !string.IsNullOrEmpty(read.Name))
+            {
+                foreach (var s in slots)
+                {
+                    if (matched.Contains(s)) continue;
+                    if (!string.Equals(SlotName(s), read.Name, StringComparison.Ordinal)) continue;
+                    int d = Math.Abs(s.Y - read.CenterY);
+                    if (d < best) { best = d; slot = s; }
+                }
+                if (slot is not null)
+                {
+                    matchedByName = true;
+                    movedByScroll = best > Tolerance;
+                    if (movedByScroll) movedByScrollCount++;
+                    slot.Y = read.CenterY;
+                }
+            }
+
             foreach (var s in slots)
             {
                 if (matched.Contains(s)) continue;
@@ -560,13 +616,55 @@ internal sealed class ScanEngine : IDisposable
 
                 // Exact dictionary matches are trustworthy enough to lock immediately; only the
                 // uncertain fuzzy/prefix matches need a second confirming read.
-                int needed = read.ExactMatch ? 1 : Confirm;
+                // While scrolling, re-matched items can move by >Tolerance; lock immediately so
+                // refreshed prices appear without waiting an extra pass.
+                int needed = read.Multiplier > 1
+                    ? 1
+                    : (!read.MultiplierExplicit
+                        ? UncertainSingleConfirm
+                        : (read.ExactMatch || (matchedByName && movedByScroll) ? 1 : Confirm));
                 if (slot.PendingCount >= needed)
                 {
                     if (!slot.Locked || slot.LockedRow.Name != read.Name)
                         Log($"locked y={slot.Y} '{read.Name}'");
+
+                    // OCR can intermittently miss the leading Nx marker on stack rows.
+                    // Once a locked row has seen a stack multiplier, keep it sticky if a
+                    // later pass reads the same item as 1x, so the price label doesn't
+                    // oscillate between unit-only and total(each).
+                    int remembered = RememberedMultiplier(quantityMemory, read.Name, nowUtc);
+                    int priorLockedMultiplier = slot.Locked && slot.LockedRow.Name == read.Name
+                        ? slot.LockedRow.Multiplier
+                        : 1;
+                    int effectiveMultiplier = ResolveMultiplierForDisplay(
+                        read.Multiplier,
+                        read.MultiplierExplicit,
+                        priorLockedMultiplier,
+                        remembered);
+
+                    bool effectiveMultiplierExplicit = read.MultiplierExplicit;
+                    if (effectiveMultiplier > 1 && slot.Locked && slot.LockedRow.Name == read.Name)
+                        effectiveMultiplierExplicit = slot.LockedRow.MultiplierExplicit || read.MultiplierExplicit;
+                    bool usedMemory = effectiveMultiplier > 1 && read.Multiplier == 1 && !read.MultiplierExplicit && remembered > 1;
+
+                    if (!string.IsNullOrEmpty(read.Name) && effectiveMultiplier > 1)
+                        quantityMemory[read.Name] = (effectiveMultiplier, nowUtc.AddMilliseconds(1500));
+
+                    double confidence = ScorePriceConfidence(
+                        read.ExactMatch,
+                        locked: true,
+                        effectiveMultiplierExplicit,
+                        effectiveMultiplier,
+                        usedMemory);
+
                     slot.Locked = true;
-                    slot.LockedRow = read with { CenterY = slot.Y };
+                    slot.LockedRow = read with
+                    {
+                        CenterY = slot.Y,
+                        Multiplier = effectiveMultiplier,
+                        MultiplierExplicit = effectiveMultiplierExplicit,
+                        Confidence = confidence,
+                    };
                 }
             }
             // A miss (read.HasPrice == false) does NOT reset the pending streak. A miss means
@@ -574,6 +672,40 @@ internal sealed class ScanEngine : IDisposable
             // The streak resets only when a DIFFERENT priced name arrives (handled in the if-branch
             // above via PendingName comparison). Resetting on misses made fuzzy/prefix items un-
             // lockable whenever OCR alternated between a correct read and a fragmented read.
+        }
+
+        // Scroll-motion mode: when multiple rows are re-matched by name but shifted by more than
+        // the normal positional tolerance in the same pass, treat it as an active scroll event and
+        // drop all unmatched stale slots right away.
+        if (movedByScrollCount >= 2)
+        {
+            scrollDetected = true;
+            for (int i = slots.Count - 1; i >= 0; i--)
+                if (!matched.Contains(slots[i])) slots.RemoveAt(i);
+        }
+
+        // If a name was matched this pass, immediately drop any unmatched stale slot carrying the
+        // same name. This prevents the "double price, a few pixels apart" artifact while scrolling.
+        var liveNames = new HashSet<string>(
+            matched.Select(SlotName)
+                   .OfType<string>()
+                   .Where(n => n.Length > 0),
+            StringComparer.Ordinal);
+        for (int i = slots.Count - 1; i >= 0; i--)
+        {
+            if (matched.Contains(slots[i])) continue;
+            var n = SlotName(slots[i]);
+            if (n is not null && liveNames.Contains(n)) slots.RemoveAt(i);
+        }
+
+        // Position de-dup for scroll jitter: if an unmatched stale slot sits close to any matched
+        // slot, drop it immediately (prevents two prices a few pixels apart for one visible row).
+        for (int i = slots.Count - 1; i >= 0; i--)
+        {
+            var s = slots[i];
+            if (matched.Contains(s)) continue;
+            bool nearLive = matched.Any(m => Math.Abs(m.Y - s.Y) <= NearDuplicateY);
+            if (nearLive) slots.RemoveAt(i);
         }
 
         for (int i = slots.Count - 1; i >= 0; i--)
@@ -585,11 +717,91 @@ internal sealed class ScanEngine : IDisposable
         var display = new List<PriceRow>(slots.Count);
         foreach (var s in slots.OrderBy(s => s.Y))
         {
-            display.Add(s.Locked
-                ? s.LockedRow
-                : s.Latest with { CenterY = s.Y, HasPrice = false, DivineValue = 0m, ExaltedValue = 0m });
+            PriceRow candidate;
+            if (s.Locked)
+            {
+                candidate = s.LockedRow;
+            }
+            else if (s.Latest.HasPrice && (s.Latest.Multiplier > 1 || s.Latest.MultiplierExplicit))
+            {
+                int remembered = RememberedMultiplier(quantityMemory, s.Latest.Name, nowUtc);
+                int effectiveMultiplier = ResolveMultiplierForDisplay(
+                    s.Latest.Multiplier,
+                    s.Latest.MultiplierExplicit,
+                    priorLockedMultiplier: 1,
+                    rememberedMultiplier: remembered);
+                bool usedMemory = effectiveMultiplier > 1 && s.Latest.Multiplier == 1 && !s.Latest.MultiplierExplicit && remembered > 1;
+                bool explicitQty = s.Latest.MultiplierExplicit || (usedMemory && remembered > 1);
+                candidate = s.Latest with
+                {
+                    CenterY = s.Y,
+                    Multiplier = effectiveMultiplier,
+                    MultiplierExplicit = explicitQty,
+                    Confidence = ScorePriceConfidence(
+                        s.Latest.ExactMatch,
+                        locked: false,
+                        explicitQty,
+                        effectiveMultiplier,
+                        usedMemory),
+                };
+            }
+            else
+            {
+                candidate = s.Latest with { CenterY = s.Y, HasPrice = false, DivineValue = 0m, ExaltedValue = 0m, Confidence = 0.0 };
+            }
+
+            if (candidate.HasPrice && candidate.Confidence < RenderThreshold)
+                candidate = candidate with { HasPrice = false, DivineValue = 0m, ExaltedValue = 0m };
+
+            display.Add(candidate);
         }
         return display;
+    }
+
+    internal static int ResolveMultiplierForDisplay(
+        int readMultiplier,
+        bool readMultiplierExplicit,
+        int priorLockedMultiplier,
+        int rememberedMultiplier)
+    {
+        if (readMultiplier > 1) return readMultiplier;
+        if (priorLockedMultiplier > 1 && readMultiplier == 1) return priorLockedMultiplier;
+        if (!readMultiplierExplicit && rememberedMultiplier > 1) return rememberedMultiplier;
+        return readMultiplier;
+    }
+
+    internal static double ScorePriceConfidence(
+        bool exactMatch,
+        bool locked,
+        bool multiplierExplicit,
+        int multiplier,
+        bool usedMemory)
+    {
+        double score = locked ? 0.82 : 0.62;
+        if (exactMatch) score += 0.12;
+        if (multiplier > 1 && multiplierExplicit) score += 0.12;
+        if (usedMemory) score += 0.06;
+        if (multiplier == 1 && !multiplierExplicit) score -= 0.18;
+        return Math.Clamp(score, 0.0, 1.0);
+    }
+
+    private static int RememberedMultiplier(
+        Dictionary<string, (int Multiplier, DateTime ExpiresUtc)> quantityMemory,
+        string name,
+        DateTime nowUtc)
+    {
+        if (string.IsNullOrEmpty(name)) return 1;
+        if (!quantityMemory.TryGetValue(name, out var m)) return 1;
+        if (m.ExpiresUtc <= nowUtc) return 1;
+        return Math.Max(1, m.Multiplier);
+    }
+
+    private static string BuildDebugHud(IReadOnlyList<PriceRow> rows, bool scrollHoldoffActive)
+    {
+        int priced = rows.Count(r => r.HasPrice);
+        int explicitQty = rows.Count(r => r.HasPrice && r.MultiplierExplicit);
+        int uncertain = rows.Count(r => r.HasPrice && !r.MultiplierExplicit);
+        return $"rows={rows.Count} priced={priced} qty-exp={explicitQty} qty-unc={uncertain} scroll={(scrollHoldoffActive ? "ON" : "off")}";
     }
 
     public void Dispose()
